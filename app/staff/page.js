@@ -608,7 +608,9 @@ async function uploadNewFiles() {
       await loadAll(currentUser);
       resetForm();
       setActiveTab("history");      
-    } catch (e) { showBanner("Error: " + e.message, "error"); }
+    } catch (e) { 
+      console.error("Submit error full:", e);
+      showBanner("Error: " + e.message, "error"); }
     setLoading(false);
   }
 
