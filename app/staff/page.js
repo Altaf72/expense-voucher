@@ -1,9 +1,9 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { db } from "../../lib/firebase";
 import {
   collection, addDoc, getDocs, doc,
-  updateDoc, deleteDoc, serverTimestamp,
+  updateDoc, deleteDoc, serverTimestamp, query, where, orderBy,
 } from "firebase/firestore";
 import { useRouter } from "next/navigation";
 import { getCurrentUser, logoutUser } from "../../lib/auth";
@@ -394,6 +394,7 @@ export default function StaffPage() {
   const [uploading, setUploading] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [editingId, setEditingId] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   // Form
   const [selectedCompany, setSelectedCompany] = useState("");
@@ -415,28 +416,63 @@ export default function StaffPage() {
   }
 
   async function loadAll(user) {
-    const compSnap = await getDocs(collection(db, "companies"));
-    const allC = compSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-    const myC = user.companies?.length ? allC.filter(c => user.companies.includes(c.id)) : allC;
-    setCompanies(myC);
+    if (!user) return;
+    
+    try {
+      // Load companies
+      const compSnap = await getDocs(collection(db, "companies"));
+      const allC = compSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+      const myC = user.companies?.length ? allC.filter(c => user.companies.includes(c.id)) : allC;
+      setCompanies(myC);
 
-    const deptSnap = await getDocs(collection(db, "departments"));
-    setDepartments(deptSnap.docs.map(d => ({ id: d.id, ...d.data() })));
+      // Load departments
+      const deptSnap = await getDocs(collection(db, "departments"));
+      setDepartments(deptSnap.docs.map(d => ({ id: d.id, ...d.data() })));
 
-    const vSnap = await getDocs(collection(db, "vouchers"));
-    const allV = vSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-    setReceivers([...new Set(allV.map(v => v.receiverName).filter(Boolean))]);
-    setMyVouchers(
-      allV.filter(v => v.createdBy === user.uid)
-        .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0))
-    );
+      // Load vouchers with query - FIXED: Only fetch user's vouchers
+      const q = query(
+        collection(db, "vouchers"),
+        where("createdBy", "==", user.uid),
+        orderBy("createdAt", "desc")
+      );
+      const vSnap = await getDocs(q);
+      const userVouchers = vSnap.docs.map(doc => {
+        const data = doc.data();
+        return { 
+          id: doc.id, 
+          ...data,
+          // Ensure date is displayed properly
+          displayDate: data.date || new Date(data.createdAt?.seconds * 1000).toLocaleDateString("en-GB")
+        };
+      });
+      
+      console.log(`Loaded ${userVouchers.length} vouchers for user ${user.uid}`);
+      setMyVouchers(userVouchers);
+      
+      // Get unique receivers from ALL vouchers (for suggestions)
+      const allVouchersSnap = await getDocs(collection(db, "vouchers"));
+      const allVouchers = allVouchersSnap.docs.map(d => d.data());
+      setReceivers([...new Set(allVouchers.map(v => v.receiverName).filter(Boolean))]);
 
-    const catSnap = await getDocs(collection(db, "categories"));
-    if (!catSnap.empty) {
-      const saved = catSnap.docs.map(d => d.data().name).filter(Boolean);
-      setCategories([...new Set([...DEFAULT_CATEGORIES, ...saved])]);
+      // Load categories
+      const catSnap = await getDocs(collection(db, "categories"));
+      if (!catSnap.empty) {
+        const saved = catSnap.docs.map(d => d.data().name).filter(Boolean);
+        setCategories([...new Set([...DEFAULT_CATEGORIES, ...saved])]);
+      }
+    } catch (error) {
+      console.error("Error loading data:", error);
+      showBanner("Error loading data: " + error.message, "error");
     }
   }
+
+  const refreshVouchers = useCallback(async () => {
+    if (!currentUser) return;
+    setRefreshing(true);
+    await loadAll(currentUser);
+    setRefreshing(false);
+    showBanner("Vouchers refreshed!", "success");
+  }, [currentUser]);
 
   function handleCompanyChange(compId) {
     setSelectedCompany(compId);
@@ -485,7 +521,8 @@ export default function StaffPage() {
     setNewFiles(prev => [...prev, ...Array.from(e.target.files)]);
     e.target.value = "";
   }
-async function uploadNewFiles() {
+
+  async function uploadNewFiles() {
     if (!newFiles.length) return [];
     setUploading(true);
     const uploaded = [];
@@ -503,27 +540,19 @@ async function uploadNewFiles() {
       fd.append("file", file);
       fd.append("upload_preset", "expense_voucher");
 
-      // PDFs must use /image/upload with page conversion
-      // Images use /image/upload normally
-      // Both work with the unsigned preset on /image/upload
-      const uploadUrl = `https://api.cloudinary.com/v1_1/dsr4kaupw/image/upload`;
+      const uploadUrl = `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/image/upload`;
 
       try {
         const res = await fetch(uploadUrl, { method: "POST", body: fd });
         const data = await res.json();
 
         if (data.error) {
-          showBanner(
-            `Upload failed for "${file.name}": ${data.error.message}`,
-            "error"
-          );
+          showBanner(`Upload failed for "${file.name}": ${data.error.message}`, "error");
           console.error("Cloudinary error:", data.error);
           continue;
         }
 
         if (data.secure_url) {
-          // For PDFs uploaded as image, Cloudinary converts page 1 to image
-          // We store original URL and a preview URL
           uploaded.push({
             originalUrl:  data.secure_url,
             thumbnailUrl: isPdf
@@ -545,7 +574,6 @@ async function uploadNewFiles() {
     setUploading(false);
     return uploaded;
   }
-
 
   function showBanner(text, type = "success") {
     setMsgBanner({ text, type });
@@ -585,6 +613,7 @@ async function uploadNewFiles() {
         });
         showBanner("Voucher updated successfully!");
       } else {
+        // Get current count for reference number
         const allSnap = await getDocs(collection(db, "vouchers"));
         const refNumber = generateRef(company?.name || "EXP", allSnap.size);
         await addDoc(collection(db, "vouchers"), {
@@ -598,11 +627,17 @@ async function uploadNewFiles() {
         });
         showBanner("Voucher submitted successfully!");
       }
+      
+      // Reload all data to show the new voucher
       await loadAll(currentUser);
       resetForm();
       setActiveTab("history");      
-    } catch (e) { showBanner("Error: " + e.message, "error"); }
-    setLoading(false);
+    } catch (e) { 
+      showBanner("Error: " + e.message, "error"); 
+      console.error("Submit error:", e);
+    } finally {
+      setLoading(false);
+    }
   }
 
   function loadForEdit(v) {
@@ -636,7 +671,8 @@ async function uploadNewFiles() {
     if (!window.confirm(`Withdraw voucher ${v.refNumber}?\nThis cannot be undone.`)) return;
     try {
       await deleteDoc(doc(db, "vouchers", v.id));
-      showBanner("Voucher withdrawn."); await loadAll(currentUser);
+      showBanner("Voucher withdrawn."); 
+      await loadAll(currentUser);
     } catch (e) { showBanner("Error: " + e.message, "error"); }
   }
 
@@ -692,7 +728,13 @@ async function uploadNewFiles() {
         {[["create", editingId ? "✏️ Edit Voucher" : "Create Voucher"], ["history", "My Vouchers"]].map(([tab, label]) => (
           <button key={tab}
             style={activeTab === tab ? S.tabOn : S.tabOff}
-            onClick={() => { if (tab === "history" && activeTab === "create") resetForm(); setActiveTab(tab); }}
+            onClick={() => { 
+              if (tab === "history") {
+                if (activeTab === "create") resetForm();
+                refreshVouchers(); // Refresh when switching to history
+              }
+              setActiveTab(tab); 
+            }}
           >{label}</button>
         ))}
       </div>
@@ -825,15 +867,38 @@ async function uploadNewFiles() {
           <div>
             <div style={S.searchRow}>
               <input style={S.searchInput}
-                placeholder="🔍  Search by ref no, receiver, company, department..."
+                placeholder="🔍 Search by ref no, receiver, company, department..."
                 value={searchTerm} onChange={e => setSearchTerm(e.target.value)} />
               {searchTerm && (
                 <button style={S.clearBtn} onClick={() => setSearchTerm("")}>✕ Clear</button>
               )}
+              <button 
+                style={{...S.clearBtn, backgroundColor: "#1a6fa8", color: "#fff"}} 
+                onClick={refreshVouchers}
+                disabled={refreshing}
+              >
+                {refreshing ? "⟳ Refreshing..." : "🔄 Refresh"}
+              </button>
+            </div>
+
+            <div style={S.statsBar}>
+              <span>Total: {filteredVouchers.length} voucher{filteredVouchers.length !== 1 ? 's' : ''}</span>
+              <span>Pending: {filteredVouchers.filter(v => v.status === 'pending').length}</span>
+              <span>Approved: {filteredVouchers.filter(v => v.status === 'approved').length}</span>
             </div>
 
             {filteredVouchers.length === 0 && (
-              <p style={S.empty}>{searchTerm ? "No vouchers match your search." : "No vouchers submitted yet."}</p>
+              <p style={S.empty}>
+                {searchTerm ? "No vouchers match your search." : "No vouchers submitted yet."}
+                {!searchTerm && (
+                  <button 
+                    onClick={() => setActiveTab("create")}
+                    style={{ marginLeft: 12, padding: "6px 12px", backgroundColor: "#1a6fa8", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer" }}
+                  >
+                    + Create your first voucher
+                  </button>
+                )}
+              </p>
             )}
 
             {filteredVouchers.map(v => {
@@ -850,7 +915,7 @@ async function uploadNewFiles() {
                   {/* Row 1 — ref + date + status */}
                   <div style={S.vTop}>
                     <span style={S.vRef}>{v.refNumber}</span>
-                    <span style={S.vDate}>{v.date}</span>
+                    <span style={S.vDate}>{v.date || v.displayDate}</span>
                     <span style={{ ...S.badge, backgroundColor: sc.bg, color: sc.fg }}>
                       {v.status?.toUpperCase()}
                     </span>
@@ -956,6 +1021,7 @@ const S = {
   searchRow: { display: "flex", alignItems: "center", gap: 10, marginBottom: 16 },
   searchInput: { flex: 1, padding: "10px 14px", borderRadius: 8, border: "1px solid #ddd", fontSize: 14, color: "#333", outline: "none" },
   clearBtn: { padding: "8px 14px", background: "#eee", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13, color: "#555", whiteSpace: "nowrap" },
+  statsBar: { display: "flex", gap: 20, padding: "10px 14px", backgroundColor: "#f8f9fa", borderRadius: 8, marginBottom: 16, fontSize: 13, fontWeight: 500, color: "#555" },
   empty: { color: "#999", fontSize: 14, fontStyle: "italic", textAlign: "center", marginTop: 40 },
   vCard: { backgroundColor: "#fff", borderRadius: 10, padding: "12px 14px", marginBottom: 10, boxShadow: "0 1px 5px rgba(0,0,0,0.07)" },
   vTop: { display: "flex", alignItems: "center", gap: 10, marginBottom: 7 },
