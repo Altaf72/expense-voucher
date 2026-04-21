@@ -598,7 +598,9 @@ async function uploadNewFiles() {
         });
         showBanner("Voucher submitted successfully!");
       }
-      resetForm(); await loadAll(currentUser); setActiveTab("history");
+      await loadAll(currentUser);
+      resetForm();
+      setActiveTab("history");      
     } catch (e) { showBanner("Error: " + e.message, "error"); }
     setLoading(false);
   }
@@ -780,7 +782,8 @@ async function uploadNewFiles() {
               <label style={S.uploadBtn}>
                 📎 Choose Files
                 <input type="file" accept=".pdf,.jpg,.jpeg,.png" multiple
-                  onChange={handleFileSelect} style={{ display: "none" }} />
+                  onChange={handleFileSelect} style={{ display: "none" }}
+                  key={newFiles.length} />
               </label>
               <span style={{ fontSize: 12, color: "#999" }}>PDF, JPG, PNG — max 5MB each</span>
             </div>
